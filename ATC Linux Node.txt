@@ -1,0 +1,14 @@
+ATC Linux Node
+===========================
+
+docker run -it -d \
+  --name atc_linux_node_001 \
+  --network web \
+  -p 6585:80 \
+  -p 5910:5900   \
+  -e VNC_PASSWORD=lifeisgood1234 \
+  emasanga/thunder-desktop:alpha
+
+
+
+172.206.60.119
