@@ -1,0 +1,17 @@
+# General Automation Structure
+
+1. Start Screen
+==================================
+docker exec -d atc_linux_node_001 sh -c "Xvfb :1 -screen 0 1280x604x16"
+
+docker exec -d atc_linux_node_001 sh -c "Xvfb :2 -screen 0 1280x604x16"
+
+
+2. Initiate ATC RF Config
+==================================
+python3 scripts/initiate_rf_config.py
+
+
+3. Start RF Client
+==================================
+docker exec -it atc-vnode-2-Btkozl sh -c "DISPLAY=:1 /root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python /root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v1.py"

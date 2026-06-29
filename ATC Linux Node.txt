@@ -7,7 +7,7 @@ docker run -it -d \
   -p 6585:80 \
   -p 5910:5900   \
   -e VNC_PASSWORD=lifeisgood1234 \
-  emasanga/thunder-desktop:alpha
+ emasanga/node_pipeline:latest
 
 
 
