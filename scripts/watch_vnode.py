@@ -24,7 +24,7 @@ CHECK_INTERVAL = 30              # seconds between health checks
 APP_CMD = (
     "DISPLAY=:1 "
     "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python "
-    "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v1.py"
+    "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v2.py"
 )
 LOG_FILE = "/var/log/watch_vnode.log"  # change if you don't have write access here
 # ---------------------------------------------------------------------------
