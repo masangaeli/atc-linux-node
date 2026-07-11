@@ -11,4 +11,16 @@ docker run -it -d \
 
 
 
+
+docker run -it -d \
+  --name atc_linux_node_002 \
+  --network web \
+  -p 6585:80 \
+  -p 5910:5900   \
+  -e VNC_PASSWORD=lifeisgood1234 \
+ theasp/novnc:latest
+
+
+
+
 172.206.60.119
