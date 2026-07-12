@@ -2,9 +2,10 @@
 """
 watch_vnode.py
 
-Polls a docker container's health status. Whenever the container is
-reported "unhealthy", it stops it, starts it again, and re-launches
-app_v1.py inside it. Runs forever until you kill it (Ctrl+C or systemd stop).
+On startup, pulls the latest code (git pull origin main) in the source
+directory. Then polls docker container health status. Whenever a container
+is reported "unhealthy", it stops it, starts it again, and re-launches
+app_v2.py inside it. Runs forever until you kill it (Ctrl+C or systemd stop).
 
 Usage:
     python3 watch_vnode.py
@@ -27,6 +28,9 @@ APP_CMD = (
     "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v2.py"
 )
 LOG_FILE = "/var/log/watch_vnode.log"  # change if you don't have write access here
+
+GIT_REPO_DIR = "/root/Desktop/awesome-tradescopier/source_code"
+GIT_BRANCH = "main"
 # ---------------------------------------------------------------------------
 
 
@@ -51,6 +55,25 @@ def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
         text=True,
         **kwargs,
     )
+
+
+def git_pull_latest() -> None:
+    """Pull the latest code in GIT_REPO_DIR before starting the watchdog loop."""
+    log(f"Pulling latest code in '{GIT_REPO_DIR}' (git pull origin {GIT_BRANCH})...")
+
+    result = run(
+        ["git", "pull", "origin", GIT_BRANCH],
+        cwd=GIT_REPO_DIR,
+    )
+
+    if result.returncode == 0:
+        log(f"git pull succeeded:\n{result.stdout.strip()}")
+    else:
+        log(
+            f"WARNING: git pull failed (exit code {result.returncode}):\n"
+            f"{result.stdout.strip()}\n"
+            "Continuing with existing code on disk."
+        )
 
 
 def get_matching_containers(prefix: str) -> list:
@@ -85,7 +108,7 @@ def restart_and_launch(name: str) -> None:
     # give the container a moment to fully come up before exec'ing into it
     time.sleep(5)
 
-    log(f"Launching app_v1.py inside '{name}'...")
+    log(f"Launching app_v2.py inside '{name}'...")
     # -d (detached) instead of -it: this script has no TTY to attach to
     exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD])
     if exec_result.returncode != 0:
@@ -115,6 +138,8 @@ def check_one(name: str) -> None:
 
 
 def main() -> None:
+    git_pull_latest()
+
     log(f"Starting watchdog for containers matching '{CONTAINER_PREFIX}*' (checking every {CHECK_INTERVAL}s).")
 
     while True:
