@@ -57,22 +57,24 @@ def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     )
 
 
-def git_pull_latest() -> None:
-    """Pull the latest code in GIT_REPO_DIR before starting the watchdog loop."""
-    log(f"Pulling latest code in '{GIT_REPO_DIR}' (git pull origin {GIT_BRANCH})...")
+def git_pull_latest(container: str) -> None:
+    """Pull the latest code inside `container` at GIT_REPO_DIR, via docker exec.
 
-    result = run(
-        ["git", "pull", "origin", GIT_BRANCH],
-        cwd=GIT_REPO_DIR,
-    )
+    GIT_REPO_DIR is a path inside the container's filesystem, not the host's,
+    so this must run through `docker exec`, not a plain host subprocess.
+    """
+    log(f"[{container}] Pulling latest code in '{GIT_REPO_DIR}' (git pull origin {GIT_BRANCH})...")
+
+    git_cmd = f"cd {GIT_REPO_DIR} && git pull origin {GIT_BRANCH}"
+    result = run(["docker", "exec", container, "sh", "-c", git_cmd])
 
     if result.returncode == 0:
-        log(f"git pull succeeded:\n{result.stdout.strip()}")
+        log(f"[{container}] git pull succeeded:\n{result.stdout.strip()}")
     else:
         log(
-            f"WARNING: git pull failed (exit code {result.returncode}):\n"
+            f"[{container}] WARNING: git pull failed (exit code {result.returncode}):\n"
             f"{result.stdout.strip()}\n"
-            "Continuing with existing code on disk."
+            f"[{container}] Continuing with existing code in the container."
         )
 
 
@@ -138,9 +140,14 @@ def check_one(name: str) -> None:
 
 
 def main() -> None:
-    git_pull_latest()
-
     log(f"Starting watchdog for containers matching '{CONTAINER_PREFIX}*' (checking every {CHECK_INTERVAL}s).")
+
+    startup_containers = get_matching_containers(CONTAINER_PREFIX)
+    if not startup_containers:
+        log(f"No containers matching '{CONTAINER_PREFIX}*' found at startup; skipping initial git pull.")
+    else:
+        for name in startup_containers:
+            git_pull_latest(name)
 
     while True:
         try:
