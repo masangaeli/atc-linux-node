@@ -18,15 +18,44 @@ import subprocess
 import time
 import datetime
 import sys
+import requests
+
+# ATC API
+atc_api = "https://awesometradescopier.com/api" 
 
 # ---- config -------------------------------------------------------------
 CONTAINER_PREFIX = "atc-vnode"   # matches atc-vnode-2-Btkozl, atc-vnode-3-xyz, etc.
 CHECK_INTERVAL = 30              # seconds between health checks
-APP_CMD = (
+APP_CMD_RF = (
     "DISPLAY=:1 "
     "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python "
     "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v2.py"
 )
+
+APP_CMD_MT4 = (
+    "DISPLAY=:1 "
+    "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python "
+    "/root/Desktop/awesome-tradescopier/source_code/manual_client_mt/node_init/mt_manager.py start mt4"
+)
+
+APP_CMD_MT5 = (
+    "DISPLAY=:1 "
+    "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python "
+    "/root/Desktop/awesome-tradescopier/source_code/manual_client_mt/node_init/mt_manager.py start mt5"
+)
+
+APP_CMD_cTRADER = (
+    "DISPLAY=:1 "
+    "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python "
+    "/root/Desktop/awesome-tradescopier/source_code/"
+)
+
+APP_CMD_TRADELOCKER = (
+    "DISPLAY=:1 "
+    "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python "
+    "/root/Desktop/awesome-tradescopier/source_code/"
+)
+
 LOG_FILE = "/var/log/watch_vnode.log"  # change if you don't have write access here
 
 GIT_REPO_DIR = "/root/Desktop/awesome-tradescopier/source_code"
@@ -99,7 +128,17 @@ def get_health_status(name: str) -> str:
 
 
 def restart_and_launch(name: str) -> None:
-    log(f"Restarting container '{name}'...")
+    
+    # https://awesometradescopier.com/api/get/node/info/by/name/atc-vnode-4-MI7J9P
+    get_node_details = atc_api + "/get/node/info/by/name/" + name
+    
+    node_info_rq = requests.get(get_node_details)
+
+    node_info_json = node_info_rq.json()
+    
+    clientSoftware = node_info_json['node_info']['clientSoftware']
+
+    log(f"Restarting container '{name}'... - Software Version '{clientSoftware}'" )
 
     stop_result = run(["docker", "stop", name])
     log(stop_result.stdout.strip())
@@ -109,10 +148,39 @@ def restart_and_launch(name: str) -> None:
 
     # give the container a moment to fully come up before exec'ing into it
     time.sleep(5)
+    
+    exec_result = ""
 
-    log(f"Launching app_v2.py inside '{name}'...")
-    # -d (detached) instead of -it: this script has no TTY to attach to
-    exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD])
+    # Rebels Funding Client
+    if clientSoftware == "RF":
+        log(f"Launching RF app_v2.py inside '{name}'...")
+        # -d (detached) instead of -it: this script has no TTY to attach to
+        exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD_RF])
+
+    # Meta Trader 4 Client
+    elif clientSoftware == "MT4":
+        log(f"Launching MT4 inside '{name}'...")
+        # -d (detached) instead of -it: this script has no TTY to attach to
+        exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD_MT4])
+        
+    # Meta Trader 5 Client
+    elif clientSoftware == "MT5":
+        log(f"Launching MT5 inside '{name}'...")
+        # -d (detached) instead of -it: this script has no TTY to attach to
+        exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD_MT5])
+
+    # cTRADER Client
+    elif clientSoftware == "cTRADER":
+        log(f"Launching cTrader inside '{name}'...")
+        # -d (detached) instead of -it: this script has no TTY to attach to
+        exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD_cTRADER])
+
+    # TRADELOCKER Client
+    elif clientSoftware == "TRADELOCKER":
+        log(f"Launching Trade Locker inside '{name}'...")
+        # -d (detached) instead of -it: this script has no TTY to attach to
+        exec_result = run(["docker", "exec", "-d", name, "sh", "-c", APP_CMD_TRADELOCKER])
+
     if exec_result.returncode != 0:
         log(f"WARNING: docker exec returned non-zero: {exec_result.stdout.strip()}")
 

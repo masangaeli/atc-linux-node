@@ -11,7 +11,6 @@ docker run -it -d \
 
 
 
-
 docker run -it -d \
   --name atc_linux_node_002 \
   --network web \
@@ -21,6 +20,21 @@ docker run -it -d \
  theasp/novnc:latest
 
 
+-----------
+
+-> /etc/ssh/ssh_config   PasswordAuthentication yes
+
+-> sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
 
 
-172.206.60.119
+-> cat /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+
+
+-> sudo systemctl restart sshd
+
+-> sudo adduser atc-node-1
+
+-> sudo usermod -aG sudo atc-node-1
+
+-> sudo passwd atc-node-1 
+
