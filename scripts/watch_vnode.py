@@ -38,11 +38,8 @@ _MT_MANAGER   = "/root/Desktop/awesome-tradescopier/source_code/manual_client_mt
 #   - "use_shell": bool — whether to run via sh -c (needed for env vars, &&, etc.)
 #   - "cmd": str — the command string (if use_shell=True) or list of args (if use_shell=False)
 #
-# Why avoid sh -c when possible?
-#   subprocess passes list items as separate argv entries. When using sh -c,
-#   the entire command becomes a single string that the shell parses. This adds
-#   a layer of quoting complexity and swallows errors when combined with -d.
-#   Running the binary directly (use_shell=False) is cleaner and easier to debug.
+# All GUI applications need DISPLAY=:1 set for VNC/X11 forwarding
+# MT4/MT5 need special handling with proper environment variables
 #
 APP_CONFIGS = {
     "RF": {
@@ -53,17 +50,22 @@ APP_CONFIGS = {
         ),
     },
     "MT4": {
-        "use_shell": False,
-        "cmd": ["python3", _MT_MANAGER, "start", "mt4"],
+        "use_shell": True,
+        "cmd": (
+            f"DISPLAY=:1 "
+            f"python3 {_MT_MANAGER} start mt4"
+        ),
     },
     "MT5": {
-        "use_shell": False,
-        "cmd": ["python3", _MT_MANAGER, "start", "mt5"],
+        "use_shell": True,
+        "cmd": (
+            f"DISPLAY=:1 "
+            f"python3 {_MT_MANAGER} start mt5"
+        ),
     },
     "cTRADER": {
         "use_shell": True,
         "cmd": (
-            # TODO: replace with the real cTrader entry-point path
             f"DISPLAY=:1 {_VENV_PYTHON} "
             "/root/Desktop/awesome-tradescopier/source_code/"
         ),
@@ -71,7 +73,6 @@ APP_CONFIGS = {
     "TRADELOCKER": {
         "use_shell": True,
         "cmd": (
-            # TODO: replace with the real TradeLocker entry-point path
             f"DISPLAY=:1 {_VENV_PYTHON} "
             "/root/Desktop/awesome-tradescopier/source_code/"
         ),
@@ -157,33 +158,76 @@ def fetch_client_software(container_name: str) -> str | None:
         return None
 
 
-def exec_in_container(name: str, use_shell: bool, cmd, detached: bool = True) -> subprocess.CompletedProcess:
+def wait_for_x11(container_name: str, max_retries: int = 10, retry_delay: int = 5) -> bool:
     """
-    Build and run a docker exec command.
+    Wait for X11/VNC to be ready inside the container.
+    Returns True if X11 is ready, False if timeout.
+    """
+    log(f"[{container_name}] Waiting for X11/VNC to be ready...")
+    
+    # Check if DISPLAY is set and X11 is responsive
+    x_check_cmd = ["docker", "exec", container_name, "sh", "-c", "DISPLAY=:1 xdpyinfo 2>&1"]
+    
+    for attempt in range(max_retries):
+        result = run(x_check_cmd)
+        if result.returncode == 0:
+            log(f"[{container_name}] X11/VNC is ready (attempt {attempt+1}/{max_retries})")
+            return True
+        
+        log(f"[{container_name}] X11/VNC not ready yet (attempt {attempt+1}/{max_retries}): {result.stdout.strip()[:100]}")
+        time.sleep(retry_delay)
+    
+    log(f"[{container_name}] WARNING: X11/VNC not ready after {max_retries} attempts, continuing anyway...")
+    return False
 
+
+def exec_in_container(name: str, use_shell: bool, cmd, detached: bool = True, 
+                     env_vars: dict = None) -> subprocess.CompletedProcess:
+    """
+    Build and run a docker exec command with proper environment variables.
+    
     Args:
         name: container name
         use_shell: if True, run via `sh -c "cmd"`; if False, run cmd directly as argv
         cmd: str (if use_shell=True) or list of str (if use_shell=False)
         detached: whether to pass -d to docker exec
+        env_vars: dict of additional environment variables to set
 
     Returns:
         subprocess.CompletedProcess
     """
     base = ["docker", "exec"]
+    
+    # Always set DISPLAY for GUI applications
+    base.extend(["-e", "DISPLAY=:1"])
+    
+    # Set Xauthority if needed (adjust path as needed)
+    base.extend(["-e", "XAUTHORITY=/root/.Xauthority"])
+    
+    # Add any additional environment variables
+    if env_vars:
+        for key, value in env_vars.items():
+            base.extend(["-e", f"{key}={value}"])
+    
+    # Set working directory to ensure relative paths work
+    base.extend(["-w", "/root/Desktop/awesome-tradescopier/source_code"])
+    
     if detached:
         base.append("-d")
     base.append(name)
 
     if use_shell:
-        # cmd must be a string; wrap it in sh -c
+        # Ensure DISPLAY is set in the shell command
+        if isinstance(cmd, str) and "DISPLAY" not in cmd:
+            cmd = f"DISPLAY=:1 {cmd}"
         base.extend(["sh", "-c", cmd])
     else:
-        # cmd must be a list; append directly (no shell wrapper)
+        # For non-shell commands, ensure DISPLAY is passed as env
         if isinstance(cmd, str):
             cmd = [cmd]
         base.extend(cmd)
 
+    log(f"[{name}] Exec command: {' '.join(base)}")
     return run(base)
 
 
@@ -204,9 +248,29 @@ def restart_and_launch(name: str) -> None:
     log(f"[{name}] start: {start_result.stdout.strip()}")
 
     # Give the container a moment to fully come up before exec-ing into it
+    log(f"[{name}] Waiting for container to start (60s)...")
     time.sleep(60)
+    
+    # Wait for X11/VNC to be ready
+    wait_for_x11(name)
+    
+    # Additional wait for X11 to stabilize
+    time.sleep(5)
 
-    # ── 3. Pick the right launch config ───────────────────────────────────
+    # ── 3. Debug: Check environment inside container ──────────────────────
+    log(f"[{name}] Debug: Checking environment variables...")
+    env_check = run(["docker", "exec", name, "sh", "-c", "env | grep -E 'DISPLAY|XAUTHORITY|USER|HOME'"])
+    log(f"[{name}] Environment:\n{env_check.stdout.strip()}")
+    
+    # Check if X11 is working
+    x_check = run(["docker", "exec", name, "sh", "-c", "DISPLAY=:1 xdpyinfo 2>&1 | head -5"])
+    log(f"[{name}] X11 check:\n{x_check.stdout.strip()}")
+    
+    # Check if mt_manager.py exists
+    mt_check = run(["docker", "exec", name, "sh", "-c", f"ls -la {_MT_MANAGER} 2>&1"])
+    log(f"[{name}] MT Manager path check:\n{mt_check.stdout.strip()}")
+
+    # ── 4. Pick the right launch config ───────────────────────────────────
     app_cfg = APP_CONFIGS.get(client_software)
     if app_cfg is None:
         log(
@@ -227,18 +291,21 @@ def restart_and_launch(name: str) -> None:
         )
         return
 
-    # ── 4. Launch the app inside the container ─────────────────────────────
+    # ── 5. Launch the app inside the container ─────────────────────────────
     log(f"[{name}] Launching {client_software} app...")
     log(f"[{name}] exec args: shell={use_shell}, cmd={app_cmd}")
 
-    # DEBUG: first run WITHOUT -d so we can see any immediate errors in the log.
-    # If the command is long-running (GUI apps), this will block the watchdog.
-    # For MT4/MT5, mt_manager.py is a CLI that should exit quickly after starting
-    # the MT terminal, so blocking briefly is acceptable.
-    # If you need fully non-blocking for GUI apps, comment out the debug run
-    # and uncomment the detached run below.
+    # For MT4/MT5, we need to run with proper environment
+    extra_env = {}
+    if client_software in ["MT4", "MT5"]:
+        # Add any MT4/MT5 specific environment variables here
+        extra_env["DISPLAY"] = ":1"
+        extra_env["LANG"] = "en_US.UTF-8"
+        extra_env["LC_ALL"] = "en_US.UTF-8"
+
+    # First, run without -d to capture any immediate errors
     log(f"[{name}] DEBUG: running without -d first to capture any startup errors...")
-    debug_result = exec_in_container(name, use_shell, app_cmd, detached=False)
+    debug_result = exec_in_container(name, use_shell, app_cmd, detached=False, env_vars=extra_env)
     if debug_result.returncode != 0:
         log(f"[{name}] DEBUG: startup error (exit {debug_result.returncode}):\n{debug_result.stdout.strip()}")
     else:
@@ -246,12 +313,24 @@ def restart_and_launch(name: str) -> None:
 
     # Now run detached so the process survives even if the watchdog restarts
     log(f"[{name}] Running detached exec now...")
-    exec_result = exec_in_container(name, use_shell, app_cmd, detached=True)
+    exec_result = exec_in_container(name, use_shell, app_cmd, detached=True, env_vars=extra_env)
 
     if exec_result.returncode != 0:
         log(f"[{name}] WARNING: docker exec -d returned non-zero: {exec_result.stdout.strip()}")
     else:
         log(f"[{name}] Restart + launch sequence complete.")
+    
+    # ── 6. Verify the process is running ──────────────────────────────────
+    time.sleep(5)  # Give the process time to start
+    
+    if client_software in ["MT4", "MT5"]:
+        # Check if mt_manager or terminal processes are running
+        ps_check = run(["docker", "exec", name, "sh", "-c", "ps aux | grep -E 'mt_manager|terminal|meta' | grep -v grep"])
+        log(f"[{name}] Running processes:\n{ps_check.stdout.strip()}")
+        
+        # Check if wine processes are running (for MT4/MT5)
+        wine_check = run(["docker", "exec", name, "sh", "-c", "ps aux | grep wine | grep -v grep"])
+        log(f"[{name}] Wine processes:\n{wine_check.stdout.strip()}")
 
 
 def check_one(name: str) -> None:
@@ -303,6 +382,8 @@ def main() -> None:
             sys.exit(0)
         except Exception as e:
             log(f"ERROR: unexpected exception in watchdog loop: {e}")
+            import traceback
+            log(f"Traceback:\n{traceback.format_exc()}")
 
         time.sleep(CHECK_INTERVAL)
 
