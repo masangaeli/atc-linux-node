@@ -204,7 +204,7 @@ def restart_and_launch(name: str) -> None:
     log(f"[{name}] start: {start_result.stdout.strip()}")
 
     # Give the container a moment to fully come up before exec-ing into it
-    time.sleep(5)
+    time.sleep(60)
 
     # ── 3. Pick the right launch config ───────────────────────────────────
     app_cfg = APP_CONFIGS.get(client_software)
