@@ -32,29 +32,50 @@ CHECK_INTERVAL   = 30            # seconds between health checks
 _VENV_PYTHON  = "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python"
 _MT_MANAGER   = "/root/Desktop/awesome-tradescopier/source_code/manual_client_mt/node_init/mt_manager.py"
 
-# Per-software launch commands executed inside the container via `docker exec -d`
+# Per-software launch configs.
 #
-# RF  – needs DISPLAY (runs a GUI automation app via the venv)
-# MT4 / MT5 – mt_manager.py is a plain CLI tool that talks to Wine/wineserver;
-#             it does NOT need DISPLAY or the RF venv.
-# cTrader / TradeLocker – fill in the real entry-point paths when ready.
-APP_CMDS = {
-    "RF": (
-        f"DISPLAY=:1 {_VENV_PYTHON} "
-        "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v2.py"
-    ),
-    "MT4": f"python3 {_MT_MANAGER} start mt4",
-    "MT5": f"python3 {_MT_MANAGER} start mt5",
-    "cTRADER": (
-        # TODO: replace with the real cTrader entry-point path
-        f"DISPLAY=:1 {_VENV_PYTHON} "
-        "/root/Desktop/awesome-tradescopier/source_code/"
-    ),
-    "TRADELOCKER": (
-        # TODO: replace with the real TradeLocker entry-point path
-        f"DISPLAY=:1 {_VENV_PYTHON} "
-        "/root/Desktop/awesome-tradescopier/source_code/"
-    ),
+# Each entry is a dict with:
+#   - "use_shell": bool — whether to run via sh -c (needed for env vars, &&, etc.)
+#   - "cmd": str — the command string (if use_shell=True) or list of args (if use_shell=False)
+#
+# Why avoid sh -c when possible?
+#   subprocess passes list items as separate argv entries. When using sh -c,
+#   the entire command becomes a single string that the shell parses. This adds
+#   a layer of quoting complexity and swallows errors when combined with -d.
+#   Running the binary directly (use_shell=False) is cleaner and easier to debug.
+#
+APP_CONFIGS = {
+    "RF": {
+        "use_shell": True,
+        "cmd": (
+            f"DISPLAY=:1 {_VENV_PYTHON} "
+            "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/app_v2.py"
+        ),
+    },
+    "MT4": {
+        "use_shell": False,
+        "cmd": ["python3", _MT_MANAGER, "start", "mt4"],
+    },
+    "MT5": {
+        "use_shell": False,
+        "cmd": ["python3", _MT_MANAGER, "start", "mt5"],
+    },
+    "cTRADER": {
+        "use_shell": True,
+        "cmd": (
+            # TODO: replace with the real cTrader entry-point path
+            f"DISPLAY=:1 {_VENV_PYTHON} "
+            "/root/Desktop/awesome-tradescopier/source_code/"
+        ),
+    },
+    "TRADELOCKER": {
+        "use_shell": True,
+        "cmd": (
+            # TODO: replace with the real TradeLocker entry-point path
+            f"DISPLAY=:1 {_VENV_PYTHON} "
+            "/root/Desktop/awesome-tradescopier/source_code/"
+        ),
+    },
 }
 
 LOG_FILE      = "/var/log/watch_vnode.log"  # change if you don't have write access
@@ -136,6 +157,36 @@ def fetch_client_software(container_name: str) -> str | None:
         return None
 
 
+def exec_in_container(name: str, use_shell: bool, cmd, detached: bool = True) -> subprocess.CompletedProcess:
+    """
+    Build and run a docker exec command.
+
+    Args:
+        name: container name
+        use_shell: if True, run via `sh -c "cmd"`; if False, run cmd directly as argv
+        cmd: str (if use_shell=True) or list of str (if use_shell=False)
+        detached: whether to pass -d to docker exec
+
+    Returns:
+        subprocess.CompletedProcess
+    """
+    base = ["docker", "exec"]
+    if detached:
+        base.append("-d")
+    base.append(name)
+
+    if use_shell:
+        # cmd must be a string; wrap it in sh -c
+        base.extend(["sh", "-c", cmd])
+    else:
+        # cmd must be a list; append directly (no shell wrapper)
+        if isinstance(cmd, str):
+            cmd = [cmd]
+        base.extend(cmd)
+
+    return run(base)
+
+
 def restart_and_launch(name: str) -> None:
     # ── 1. Fetch the software type for this container ──────────────────────
     client_software = fetch_client_software(name)
@@ -155,17 +206,21 @@ def restart_and_launch(name: str) -> None:
     # Give the container a moment to fully come up before exec-ing into it
     time.sleep(5)
 
-    # ── 3. Pick the right launch command ───────────────────────────────────
-    app_cmd = APP_CMDS.get(client_software)
-    if app_cmd is None:
+    # ── 3. Pick the right launch config ───────────────────────────────────
+    app_cfg = APP_CONFIGS.get(client_software)
+    if app_cfg is None:
         log(
             f"[{name}] WARNING: unknown clientSoftware '{client_software}'. "
             "No launch command defined — container started but no app launched."
         )
         return
 
+    app_cmd = app_cfg["cmd"]
+    use_shell = app_cfg["use_shell"]
+
     # Bail out early if the command path is clearly incomplete (TODO placeholder)
-    if app_cmd.rstrip().endswith("/"):
+    cmd_check = app_cmd if isinstance(app_cmd, str) else " ".join(app_cmd)
+    if cmd_check.rstrip().endswith("/"):
         log(
             f"[{name}] WARNING: launch command for '{client_software}' is incomplete "
             "(entry-point path not yet set). Container started but no app launched."
@@ -174,14 +229,27 @@ def restart_and_launch(name: str) -> None:
 
     # ── 4. Launch the app inside the container ─────────────────────────────
     log(f"[{name}] Launching {client_software} app...")
-    print("Wait for 60 seconds")
-    sleep(60)
-    print("Launching now")
-    # -d (detached): this watchdog has no TTY to attach to
-    exec_result = run(["docker", "exec", "-d", name, "sh", "-c", app_cmd])
+    log(f"[{name}] exec args: shell={use_shell}, cmd={app_cmd}")
+
+    # DEBUG: first run WITHOUT -d so we can see any immediate errors in the log.
+    # If the command is long-running (GUI apps), this will block the watchdog.
+    # For MT4/MT5, mt_manager.py is a CLI that should exit quickly after starting
+    # the MT terminal, so blocking briefly is acceptable.
+    # If you need fully non-blocking for GUI apps, comment out the debug run
+    # and uncomment the detached run below.
+    log(f"[{name}] DEBUG: running without -d first to capture any startup errors...")
+    debug_result = exec_in_container(name, use_shell, app_cmd, detached=False)
+    if debug_result.returncode != 0:
+        log(f"[{name}] DEBUG: startup error (exit {debug_result.returncode}):\n{debug_result.stdout.strip()}")
+    else:
+        log(f"[{name}] DEBUG: startup output:\n{debug_result.stdout.strip()}")
+
+    # Now run detached so the process survives even if the watchdog restarts
+    log(f"[{name}] Running detached exec now...")
+    exec_result = exec_in_container(name, use_shell, app_cmd, detached=True)
 
     if exec_result.returncode != 0:
-        log(f"[{name}] WARNING: docker exec returned non-zero: {exec_result.stdout.strip()}")
+        log(f"[{name}] WARNING: docker exec -d returned non-zero: {exec_result.stdout.strip()}")
     else:
         log(f"[{name}] Restart + launch sequence complete.")
 
