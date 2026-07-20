@@ -19,6 +19,7 @@ import time
 import datetime
 import sys
 import requests
+from time import sleep
 
 # ATC API
 ATC_API = "https://awesometradescopier.com/api"
