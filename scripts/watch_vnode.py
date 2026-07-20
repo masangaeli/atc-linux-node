@@ -173,6 +173,9 @@ def restart_and_launch(name: str) -> None:
 
     # ── 4. Launch the app inside the container ─────────────────────────────
     log(f"[{name}] Launching {client_software} app...")
+    print("Wait for 60 seconds")
+    sleep(60)
+    print("Launching now")
     # -d (detached): this watchdog has no TTY to attach to
     exec_result = run(["docker", "exec", "-d", name, "sh", "-c", app_cmd])
 
