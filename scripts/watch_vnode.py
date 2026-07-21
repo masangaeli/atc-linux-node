@@ -2,16 +2,20 @@
 """
 watch_vnode.py
 
-On startup, pulls the latest code (git pull origin main) in the source
-directory. Then polls docker container health status. Whenever a container
-is reported "unhealthy", it stops it, starts it again, and re-launches
-the appropriate client software inside it (determined by the ATC API).
+On startup:
+  1. Discovers all containers matching CONTAINER_PREFIX (running or stopped).
+  2. Starts any that are not already running.
+  3. Pulls the latest code inside each running container.
+  4. Launches the appropriate client app in every container.
+
+Then enters a polling loop:
+  - Every CHECK_INTERVAL seconds it re-discovers all matching containers,
+    ensures each one is running, and restarts+relaunches any that are unhealthy.
 
 Usage:
     python3 watch_vnode.py
 
-Optional: run it under systemd, or `nohup python3 watch_vnode.py &`,
-so it survives your terminal closing.
+Run under systemd or `nohup python3 watch_vnode.py &` so it survives terminal close.
 """
 
 import subprocess
@@ -19,28 +23,25 @@ import time
 import datetime
 import sys
 import requests
-from time import sleep
 
-# ATC API
+# ── ATC API ──────────────────────────────────────────────────────────────────
 ATC_API = "https://awesometradescopier.com/api"
 
-# ---- config -------------------------------------------------------------
-CONTAINER_PREFIX = "atc-vnode"   # matches atc-vnode-2-Btkozl, atc-vnode-3-xyz, etc.
-CHECK_INTERVAL   = 30            # seconds between health checks
+# ── Config ───────────────────────────────────────────────────────────────────
+CONTAINER_PREFIX = "atc-vnode"   # matches atc-vnode-2-Btkozl, atc-vnode-3-xyz …
+CHECK_INTERVAL   = 30            # seconds between health-check passes
 
-# Shared paths
-_VENV_PYTHON  = "/root/Desktop/awesome-tradescopier/source_code/client_rf_trader/venv/bin/python"
-_MT_MANAGER   = "/root/Desktop/awesome-tradescopier/source_code/manual_client_mt/node_init/mt_manager.py"
+# Shared paths (inside container)
+_VENV_PYTHON = (
+    "/root/Desktop/awesome-tradescopier/source_code"
+    "/client_rf_trader/venv/bin/python"
+)
+_MT_MANAGER = (
+    "/root/Desktop/awesome-tradescopier/source_code"
+    "/manual_client_mt/node_init/mt_manager.py"
+)
 
-# Per-software launch configs.
-#
-# Each entry is a dict with:
-#   - "use_shell": bool — whether to run via sh -c (needed for env vars, &&, etc.)
-#   - "cmd": str — the command string (if use_shell=True) or list of args (if use_shell=False)
-#
-# All GUI applications need DISPLAY=:1 set for VNC/X11 forwarding
-# MT4/MT5 need special handling with proper environment variables
-#
+# Per-software launch configs
 APP_CONFIGS = {
     "RF": {
         "use_shell": True,
@@ -51,39 +52,35 @@ APP_CONFIGS = {
     },
     "MT4": {
         "use_shell": True,
-        "cmd": (
-            f"DISPLAY=:1 "
-            f"python3 {_MT_MANAGER} start mt4"
-        ),
+        "cmd": f"DISPLAY=:1 python3 {_MT_MANAGER} start mt4",
     },
     "MT5": {
         "use_shell": True,
-        "cmd": (
-            f"DISPLAY=:1 "
-            f"python3 {_MT_MANAGER} start mt5"
-        ),
+        "cmd": f"DISPLAY=:1 python3 {_MT_MANAGER} start mt5",
     },
     "cTRADER": {
         "use_shell": True,
         "cmd": (
             f"DISPLAY=:1 {_VENV_PYTHON} "
-            "/root/Desktop/awesome-tradescopier/source_code/"
+            "/root/Desktop/awesome-tradescopier/source_code/"   # TODO: add entry point
         ),
     },
     "TRADELOCKER": {
         "use_shell": True,
         "cmd": (
             f"DISPLAY=:1 {_VENV_PYTHON} "
-            "/root/Desktop/awesome-tradescopier/source_code/"
+            "/root/Desktop/awesome-tradescopier/source_code/"   # TODO: add entry point
         ),
     },
 }
 
-LOG_FILE      = "/var/log/watch_vnode.log"  # change if you don't have write access
-GIT_REPO_DIR  = "/root/Desktop/awesome-tradescopier/source_code"
-GIT_BRANCH    = "main"
-# ---------------------------------------------------------------------------
+LOG_FILE     = "/var/log/watch_vnode.log"
+GIT_REPO_DIR = "/root/Desktop/awesome-tradescopier/source_code"
+GIT_BRANCH   = "main"
+# ─────────────────────────────────────────────────────────────────────────────
 
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -93,11 +90,13 @@ def log(msg: str) -> None:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
     except OSError:
-        pass  # no write access to LOG_FILE, skip file logging
+        pass
 
+
+# ── Low-level helpers ─────────────────────────────────────────────────────────
 
 def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
-    """Run a command, capturing output, without raising on non-zero exit."""
+    """Run a command, capturing combined stdout+stderr, without raising on non-zero exit."""
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -107,28 +106,24 @@ def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     )
 
 
-def git_pull_latest(container: str) -> None:
-    """Pull the latest code inside `container` at GIT_REPO_DIR, via docker exec."""
-    log(f"[{container}] Pulling latest code (git pull origin {GIT_BRANCH})...")
-    git_cmd = f"cd {GIT_REPO_DIR} && git pull origin {GIT_BRANCH}"
-    result  = run(["docker", "exec", container, "sh", "-c", git_cmd])
-    if result.returncode == 0:
-        log(f"[{container}] git pull succeeded:\n{result.stdout.strip()}")
-    else:
-        log(
-            f"[{container}] WARNING: git pull failed (exit {result.returncode}):\n"
-            f"{result.stdout.strip()}\n"
-            f"[{container}] Continuing with existing code."
-        )
-
-
-def get_matching_containers(prefix: str) -> list:
-    """Return all container names (running or not) that start with `prefix`."""
+def get_matching_containers(prefix: str) -> list[str]:
+    """Return all container names (running or stopped) that start with *prefix*."""
     result = run(["docker", "ps", "-a", "--format", "{{.Names}}"])
     return [n for n in result.stdout.splitlines() if n.startswith(prefix)]
 
 
+def get_container_state(name: str) -> str:
+    """Return the low-level State.Status string: running, exited, created, …"""
+    result = run([
+        "docker", "inspect",
+        "--format", "{{.State.Status}}",
+        name,
+    ])
+    return result.stdout.strip() or "unknown"
+
+
 def get_health_status(name: str) -> str:
+    """Return health-check status or 'no-healthcheck' / 'unknown'."""
     result = run([
         "docker", "inspect",
         "--format",
@@ -138,233 +133,280 @@ def get_health_status(name: str) -> str:
     return result.stdout.strip() or "unknown"
 
 
-def fetch_client_software(container_name: str) -> str | None:
+# ── Container lifecycle ───────────────────────────────────────────────────────
+
+def ensure_running(name: str) -> bool:
     """
-    Ask the ATC API which software this container should run.
-    Returns the clientSoftware string (e.g. "MT4", "MT5", "RF") or None on error.
+    Start the container if it is not already running.
+    Returns True if the container is (now) running, False on failure.
     """
-    url = f"{ATC_API}/get/node/info/by/name/{container_name}"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        software = data["node_info"]["clientSoftware"]
-        return software
-    except requests.RequestException as e:
-        log(f"[{container_name}] ERROR fetching node info from API: {e}")
-        return None
-    except (KeyError, ValueError) as e:
-        log(f"[{container_name}] ERROR parsing API response: {e}")
-        return None
+    state = get_container_state(name)
+    if state == "running":
+        return True
+
+    log(f"[{name}] State is '{state}' — starting container...")
+    result = run(["docker", "start", name])
+    if result.returncode != 0:
+        log(f"[{name}] ERROR: docker start failed:\n{result.stdout.strip()}")
+        return False
+
+    # Brief settle time then verify
+    time.sleep(5)
+    new_state = get_container_state(name)
+    if new_state == "running":
+        log(f"[{name}] Container started successfully.")
+        return True
+    else:
+        log(f"[{name}] ERROR: Container state after start is '{new_state}' — not running.")
+        return False
 
 
-def wait_for_x11(container_name: str, max_retries: int = 10, retry_delay: int = 5) -> bool:
-    """
-    Wait for X11/VNC to be ready inside the container.
-    Returns True if X11 is ready, False if timeout.
-    """
-    log(f"[{container_name}] Waiting for X11/VNC to be ready...")
-    
-    # Check if DISPLAY is set and X11 is responsive
-    x_check_cmd = ["docker", "exec", container_name, "sh", "-c", "DISPLAY=:1 xdpyinfo 2>&1"]
-    
-    for attempt in range(max_retries):
-        result = run(x_check_cmd)
+def wait_for_x11(name: str, max_retries: int = 10, retry_delay: int = 5) -> bool:
+    """Wait for X11/VNC to be ready inside the container."""
+    log(f"[{name}] Waiting for X11/VNC to be ready...")
+    check_cmd = ["docker", "exec", name, "sh", "-c", "DISPLAY=:1 xdpyinfo 2>&1"]
+    for attempt in range(1, max_retries + 1):
+        result = run(check_cmd)
         if result.returncode == 0:
-            log(f"[{container_name}] X11/VNC is ready (attempt {attempt+1}/{max_retries})")
+            log(f"[{name}] X11/VNC is ready (attempt {attempt}/{max_retries})")
             return True
-        
-        log(f"[{container_name}] X11/VNC not ready yet (attempt {attempt+1}/{max_retries}): {result.stdout.strip()[:100]}")
+        log(
+            f"[{name}] X11/VNC not ready yet (attempt {attempt}/{max_retries}): "
+            f"{result.stdout.strip()[:100]}"
+        )
         time.sleep(retry_delay)
-    
-    log(f"[{container_name}] WARNING: X11/VNC not ready after {max_retries} attempts, continuing anyway...")
+    log(f"[{name}] WARNING: X11/VNC not ready after {max_retries} attempts — continuing anyway.")
     return False
 
 
-def exec_in_container(name: str, use_shell: bool, cmd, detached: bool = True, 
-                     env_vars: dict = None) -> subprocess.CompletedProcess:
+def exec_in_container(
+    name: str,
+    use_shell: bool,
+    cmd,
+    detached: bool = True,
+    env_vars: dict | None = None,
+) -> subprocess.CompletedProcess:
     """
-    Build and run a docker exec command with proper environment variables.
-    
+    Build and run a `docker exec` command.
+
     Args:
-        name: container name
-        use_shell: if True, run via `sh -c "cmd"`; if False, run cmd directly as argv
-        cmd: str (if use_shell=True) or list of str (if use_shell=False)
-        detached: whether to pass -d to docker exec
-        env_vars: dict of additional environment variables to set
+        name:       container name
+        use_shell:  if True, run via `sh -c "<cmd>"`; if False, run cmd as argv list
+        cmd:        str (use_shell=True) or list[str] (use_shell=False)
+        detached:   pass -d to docker exec so the process survives watchdog restarts
+        env_vars:   extra environment variables to inject
 
     Returns:
         subprocess.CompletedProcess
     """
-    base = ["docker", "exec"]
-    
-    # Always set DISPLAY for GUI applications
-    base.extend(["-e", "DISPLAY=:1"])
-    
-    # Set Xauthority if needed (adjust path as needed)
-    base.extend(["-e", "XAUTHORITY=/root/.Xauthority"])
-    
-    # Add any additional environment variables
+    base = [
+        "docker", "exec",
+        "-e", "DISPLAY=:1",
+        "-e", "XAUTHORITY=/root/.Xauthority",
+    ]
+
     if env_vars:
-        for key, value in env_vars.items():
-            base.extend(["-e", f"{key}={value}"])
-    
-    # Set working directory to ensure relative paths work
+        for k, v in env_vars.items():
+            base.extend(["-e", f"{k}={v}"])
+
     base.extend(["-w", "/root/Desktop/awesome-tradescopier/source_code"])
-    
+
     if detached:
         base.append("-d")
+
     base.append(name)
 
     if use_shell:
-        # Ensure DISPLAY is set in the shell command
         if isinstance(cmd, str) and "DISPLAY" not in cmd:
             cmd = f"DISPLAY=:1 {cmd}"
         base.extend(["sh", "-c", cmd])
     else:
-        # For non-shell commands, ensure DISPLAY is passed as env
-        if isinstance(cmd, str):
-            cmd = [cmd]
-        base.extend(cmd)
+        base.extend([cmd] if isinstance(cmd, str) else cmd)
 
-    log(f"[{name}] Exec command: {' '.join(base)}")
+    log(f"[{name}] Exec: {' '.join(base)}")
     return run(base)
 
 
+# ── Per-container operations ──────────────────────────────────────────────────
+
+def git_pull(name: str) -> None:
+    """Pull the latest code inside the container. Container must already be running."""
+    log(f"[{name}] Pulling latest code (git pull origin {GIT_BRANCH})...")
+    git_cmd = f"cd {GIT_REPO_DIR} && git pull origin {GIT_BRANCH}"
+    result = run(["docker", "exec", name, "sh", "-c", git_cmd])
+    if result.returncode == 0:
+        log(f"[{name}] git pull succeeded:\n{result.stdout.strip()}")
+    else:
+        log(
+            f"[{name}] WARNING: git pull failed (exit {result.returncode}):\n"
+            f"{result.stdout.strip()}\n"
+            f"[{name}] Continuing with existing code."
+        )
+
+
+def fetch_client_software(name: str) -> str | None:
+    """
+    Ask the ATC API which software this container should run.
+    Returns the clientSoftware string (e.g. "MT4", "MT5", "RF") or None on error.
+    """
+    url = f"{ATC_API}/get/node/info/by/name/{name}"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["node_info"]["clientSoftware"]
+    except requests.RequestException as e:
+        log(f"[{name}] ERROR fetching node info from API: {e}")
+    except (KeyError, ValueError) as e:
+        log(f"[{name}] ERROR parsing API response: {e}")
+    return None
+
+
+def launch_app(name: str, client_software: str) -> None:
+    """Launch the client app for *client_software* inside *name*."""
+    app_cfg = APP_CONFIGS.get(client_software)
+    if app_cfg is None:
+        log(
+            f"[{name}] WARNING: unknown clientSoftware '{client_software}'. "
+            "No launch command defined — container running but no app launched."
+        )
+        return
+
+    app_cmd  = app_cfg["cmd"]
+    use_shell = app_cfg["use_shell"]
+
+    # Guard against incomplete TODO placeholder paths
+    cmd_str = app_cmd if isinstance(app_cmd, str) else " ".join(app_cmd)
+    if cmd_str.rstrip().endswith("/"):
+        log(
+            f"[{name}] WARNING: launch command for '{client_software}' is incomplete "
+            "(entry-point path not set). Container running but no app launched."
+        )
+        return
+
+    extra_env: dict = {}
+    if client_software in ("MT4", "MT5"):
+        extra_env = {"DISPLAY": ":1", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+
+    log(f"[{name}] Launching {client_software} (shell={use_shell})...")
+
+    # Run once without -d to capture immediate errors
+    debug = exec_in_container(name, use_shell, app_cmd, detached=False, env_vars=extra_env)
+    if debug.returncode != 0:
+        log(f"[{name}] Startup error (exit {debug.returncode}):\n{debug.stdout.strip()}")
+    else:
+        log(f"[{name}] Startup output:\n{debug.stdout.strip()}")
+
+    # Then run detached so the process survives watchdog restarts
+    det = exec_in_container(name, use_shell, app_cmd, detached=True, env_vars=extra_env)
+    if det.returncode != 0:
+        log(f"[{name}] WARNING: detached exec returned non-zero: {det.stdout.strip()}")
+    else:
+        log(f"[{name}] {client_software} launched (detached).")
+
+    # Quick sanity check
+    time.sleep(5)
+    if client_software in ("MT4", "MT5"):
+        ps = run(["docker", "exec", name, "sh", "-c",
+                  "ps aux | grep -E 'mt_manager|terminal|wine' | grep -v grep"])
+        log(f"[{name}] Running processes:\n{ps.stdout.strip()}")
+
+
+def full_startup_sequence(name: str) -> None:
+    """
+    Bring one container all the way from stopped → running → code pulled → app launched.
+    Used both at script startup and when recovering an unhealthy container.
+    """
+    # 1. Ensure the container is running
+    if not ensure_running(name):
+        log(f"[{name}] Could not start container — skipping.")
+        return
+
+    # 2. Wait for X11 to stabilise (needed before launching GUI apps)
+    wait_for_x11(name)
+    time.sleep(5)
+
+    # 3. Pull latest code
+    git_pull(name)
+
+    # 4. Fetch software type and launch
+    client_software = fetch_client_software(name)
+    if client_software is None:
+        log(f"[{name}] Cannot determine clientSoftware — skipping launch.")
+        return
+
+    launch_app(name, client_software)
+
+
 def restart_and_launch(name: str) -> None:
-    # ── 1. Fetch the software type for this container ──────────────────────
+    """Hard-restart an unhealthy container then run the full startup sequence."""
     client_software = fetch_client_software(name)
     if client_software is None:
         log(f"[{name}] Cannot determine clientSoftware — skipping restart.")
         return
 
-    log(f"[{name}] Restarting container (clientSoftware='{client_software}')...")
+    log(f"[{name}] Restarting unhealthy container (clientSoftware='{client_software}')...")
 
-    # ── 2. Stop → start the container ──────────────────────────────────────
-    stop_result = run(["docker", "stop", name])
-    log(f"[{name}] stop: {stop_result.stdout.strip()}")
+    stop = run(["docker", "stop", name])
+    log(f"[{name}] stop → {stop.stdout.strip()}")
 
-    start_result = run(["docker", "start", name])
-    log(f"[{name}] start: {start_result.stdout.strip()}")
+    start = run(["docker", "start", name])
+    log(f"[{name}] start → {start.stdout.strip()}")
 
-    # Give the container a moment to fully come up before exec-ing into it
-    log(f"[{name}] Waiting for container to start (60s)...")
+    log(f"[{name}] Waiting 60 s for container to settle...")
     time.sleep(60)
-    
-    # Wait for X11/VNC to be ready
+
     wait_for_x11(name)
-    
-    # Additional wait for X11 to stabilize
     time.sleep(5)
 
-    # ── 3. Debug: Check environment inside container ──────────────────────
-    log(f"[{name}] Debug: Checking environment variables...")
-    env_check = run(["docker", "exec", name, "sh", "-c", "env | grep -E 'DISPLAY|XAUTHORITY|USER|HOME'"])
-    log(f"[{name}] Environment:\n{env_check.stdout.strip()}")
-    
-    # Check if X11 is working
-    x_check = run(["docker", "exec", name, "sh", "-c", "DISPLAY=:1 xdpyinfo 2>&1 | head -5"])
-    log(f"[{name}] X11 check:\n{x_check.stdout.strip()}")
-    
-    # Check if mt_manager.py exists
-    mt_check = run(["docker", "exec", name, "sh", "-c", f"ls -la {_MT_MANAGER} 2>&1"])
-    log(f"[{name}] MT Manager path check:\n{mt_check.stdout.strip()}")
+    git_pull(name)
+    launch_app(name, client_software)
 
-    # ── 4. Pick the right launch config ───────────────────────────────────
-    app_cfg = APP_CONFIGS.get(client_software)
-    if app_cfg is None:
-        log(
-            f"[{name}] WARNING: unknown clientSoftware '{client_software}'. "
-            "No launch command defined — container started but no app launched."
-        )
-        return
 
-    app_cmd = app_cfg["cmd"]
-    use_shell = app_cfg["use_shell"]
-
-    # Bail out early if the command path is clearly incomplete (TODO placeholder)
-    cmd_check = app_cmd if isinstance(app_cmd, str) else " ".join(app_cmd)
-    if cmd_check.rstrip().endswith("/"):
-        log(
-            f"[{name}] WARNING: launch command for '{client_software}' is incomplete "
-            "(entry-point path not yet set). Container started but no app launched."
-        )
-        return
-
-    # ── 5. Launch the app inside the container ─────────────────────────────
-    log(f"[{name}] Launching {client_software} app...")
-    log(f"[{name}] exec args: shell={use_shell}, cmd={app_cmd}")
-
-    # For MT4/MT5, we need to run with proper environment
-    extra_env = {}
-    if client_software in ["MT4", "MT5"]:
-        # Add any MT4/MT5 specific environment variables here
-        extra_env["DISPLAY"] = ":1"
-        extra_env["LANG"] = "en_US.UTF-8"
-        extra_env["LC_ALL"] = "en_US.UTF-8"
-
-    # First, run without -d to capture any immediate errors
-    log(f"[{name}] DEBUG: running without -d first to capture any startup errors...")
-    debug_result = exec_in_container(name, use_shell, app_cmd, detached=False, env_vars=extra_env)
-    if debug_result.returncode != 0:
-        log(f"[{name}] DEBUG: startup error (exit {debug_result.returncode}):\n{debug_result.stdout.strip()}")
-    else:
-        log(f"[{name}] DEBUG: startup output:\n{debug_result.stdout.strip()}")
-
-    # Now run detached so the process survives even if the watchdog restarts
-    log(f"[{name}] Running detached exec now...")
-    exec_result = exec_in_container(name, use_shell, app_cmd, detached=True, env_vars=extra_env)
-
-    if exec_result.returncode != 0:
-        log(f"[{name}] WARNING: docker exec -d returned non-zero: {exec_result.stdout.strip()}")
-    else:
-        log(f"[{name}] Restart + launch sequence complete.")
-    
-    # ── 6. Verify the process is running ──────────────────────────────────
-    time.sleep(5)  # Give the process time to start
-    
-    if client_software in ["MT4", "MT5"]:
-        # Check if mt_manager or terminal processes are running
-        ps_check = run(["docker", "exec", name, "sh", "-c", "ps aux | grep -E 'mt_manager|terminal|meta' | grep -v grep"])
-        log(f"[{name}] Running processes:\n{ps_check.stdout.strip()}")
-        
-        # Check if wine processes are running (for MT4/MT5)
-        wine_check = run(["docker", "exec", name, "sh", "-c", "ps aux | grep wine | grep -v grep"])
-        log(f"[{name}] Wine processes:\n{wine_check.stdout.strip()}")
-
+# ── Health-check loop ─────────────────────────────────────────────────────────
 
 def check_one(name: str) -> None:
+    # First make sure the container is actually running
+    if not ensure_running(name):
+        log(f"[{name}] Could not bring container up — will retry next cycle.")
+        return
+
     status = get_health_status(name)
 
     if status == "healthy":
-        pass  # nothing to do
+        pass  # all good
     elif status == "unhealthy":
-        log(f"[{name}] Container is UNHEALTHY — triggering restart.")
+        log(f"[{name}] UNHEALTHY — triggering restart + relaunch.")
         restart_and_launch(name)
     elif status == "starting":
-        log(f"[{name}] Container is still starting up, waiting...")
+        log(f"[{name}] Still starting — will check again next cycle.")
     elif status == "no-healthcheck":
-        log(
-            f"[{name}] No HEALTHCHECK defined in this image. "
-            "Add a HEALTHCHECK to the Dockerfile or compose config."
-        )
+        log(f"[{name}] No HEALTHCHECK in image. Add one to the Dockerfile.")
     else:
         log(f"[{name}] Unknown health status: '{status}'.")
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main() -> None:
     log(
-        f"Starting watchdog for containers matching '{CONTAINER_PREFIX}*' "
-        f"(checking every {CHECK_INTERVAL}s)."
+        f"Watchdog starting — prefix='{CONTAINER_PREFIX}*', "
+        f"interval={CHECK_INTERVAL}s"
     )
 
-    startup_containers = get_matching_containers(CONTAINER_PREFIX)
-    if not startup_containers:
-        log(f"No containers matching '{CONTAINER_PREFIX}*' found at startup; skipping initial git pull.")
+    # ── Startup pass: discover all containers, start them, pull code, launch apps ──
+    containers = get_matching_containers(CONTAINER_PREFIX)
+    if not containers:
+        log(f"No containers matching '{CONTAINER_PREFIX}*' found at startup.")
     else:
-        for name in startup_containers:
-            git_pull_latest(name)
+        log(f"Found {len(containers)} container(s) at startup: {', '.join(containers)}")
+        for name in containers:
+            log(f"[{name}] === Running startup sequence ===")
+            full_startup_sequence(name)
 
+    log("Startup complete — entering health-check loop.")
+
+    # ── Main watch loop ────────────────────────────────────────────────────────
     while True:
         try:
             containers = get_matching_containers(CONTAINER_PREFIX)
@@ -381,9 +423,8 @@ def main() -> None:
             log("Watchdog stopped by user (KeyboardInterrupt).")
             sys.exit(0)
         except Exception as e:
-            log(f"ERROR: unexpected exception in watchdog loop: {e}")
             import traceback
-            log(f"Traceback:\n{traceback.format_exc()}")
+            log(f"ERROR in watchdog loop: {e}\n{traceback.format_exc()}")
 
         time.sleep(CHECK_INTERVAL)
 
