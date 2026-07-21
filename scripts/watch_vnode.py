@@ -288,16 +288,10 @@ def launch_app(name: str, client_software: str) -> None:
     if client_software in ("MT4", "MT5"):
         extra_env = {"DISPLAY": ":1", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
 
-    log(f"[{name}] Launching {client_software} (shell={use_shell})...")
+    log(f"[{name}] Launching {client_software} (shell={use_shell}, detached=True)...")
 
-    # Run once without -d to capture immediate errors
-    debug = exec_in_container(name, use_shell, app_cmd, detached=False, env_vars=extra_env)
-    if debug.returncode != 0:
-        log(f"[{name}] Startup error (exit {debug.returncode}):\n{debug.stdout.strip()}")
-    else:
-        log(f"[{name}] Startup output:\n{debug.stdout.strip()}")
-
-    # Then run detached so the process survives watchdog restarts
+    # Always run detached — these are long-running GUI apps that never exit on
+    # their own, so a blocking exec would hang the watchdog forever.
     det = exec_in_container(name, use_shell, app_cmd, detached=True, env_vars=extra_env)
     if det.returncode != 0:
         log(f"[{name}] WARNING: detached exec returned non-zero: {det.stdout.strip()}")
